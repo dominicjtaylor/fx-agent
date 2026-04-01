@@ -5,7 +5,7 @@ Shared types and utilities for agent tool functions.
 
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
 import anthropic
 
@@ -14,7 +14,7 @@ import anthropic
 class ToolResult:
     ok: bool
     value: Any
-    error: str | None = None
+    error: Optional[str] = None
 
 
 def retry_api_call(fn, max_retries: int = 3, base_delay: float = 1.0):

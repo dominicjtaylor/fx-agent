@@ -22,18 +22,13 @@ from pathlib import Path
 from typing import Dict, Optional
 import pandas as pd
 
-from src.agent.context import load_context, load_principles
-from src.agent.registry import load_registry, save_entry, make_entry
+from src.agent.state import load_state, compute_feature_score
+from src.agent.registry import save_entry, make_entry
 from src.agent.propose import propose_feature
-from src.agent.active_features import (
-    load_active_features,
-    add_active_feature,
-    get_research_stage,
-    get_level_counts,
-    format_active_features_for_prompt,
-)
+from src.agent.active_features import add_active_feature, get_level_counts
 from src.agent.test import run_feature_test
 from src.agent.reason import reason_and_verdict
+from src.agent.novelty import check_novelty
 
 LOG_DIR = Path(__file__).resolve().parents[2] / "outputs" / "logs"
 
@@ -82,42 +77,40 @@ def run_cycle(
     pair_summary = ", ".join(f"{pair}: {len(df):,} rows" for pair, df in data.items())
     print(f"  State: {total_rows:,} total observations — {pair_summary}")
 
-    # ── Step 3-4: Feature set and research stage ──────────────────────────────
-    context = load_context()
-    principles = load_principles()
-    registry = load_registry()
-    active_features = load_active_features()
-    counts = get_level_counts(active_features)
-    stage = get_research_stage(active_features)
+    # ── Step 3-4: Load typed state ────────────────────────────────────────────
+    state = load_state()
+    counts = state.level_counts
+    stage = state.research_stage
 
     print("Current feature set...")
     print(
-        f"  State: {len(active_features)} active features "
+        f"  State: {len(state.active_features)} active features "
         f"({counts['primitive']} primitive, {counts['transform']} transform, {counts['composite']} composite)"
     )
-
     print("Research stage...")
     print(f"  Stage: {_STAGE_LABEL[stage]}")
 
-    # ── Step 5-6: Proposal ────────────────────────────────────────────────────
-    print("Proposing feature...")
-    propose_result = propose_feature(
-        context, principles, registry,
-        user_hint=user_hint,
-        active_features=active_features
-    )
+    # ── Step 5-6: Decision + Proposal (model-driven) ──────────────────────────
+    print("Deciding action and proposing feature...")
+    propose_result = propose_feature(state, user_hint=user_hint)
     if not propose_result.ok:
         raise RuntimeError(propose_result.error)
     feature = propose_result.value
     level_label = _LEVEL_LABEL.get(feature.level, feature.level)
-    print(f"  Motivation: {feature.motivation}")
+    print(f"  Action:    {feature.action} — {feature.action_rationale}")
     print(f"  Candidate: {feature.name} ({level_label})")
+    print(f"  Motivation: {feature.motivation}")
+
+    # ── Step 6b: Novelty check ────────────────────────────────────────────────
+    novelty = check_novelty(feature, state.active_features, state.registry)
+    print(f"  Novelty:   {novelty['novelty_class']} (score {novelty['novelty_score']:.2f})"
+          + (f" — most similar: {novelty['most_similar_feature']}" if novelty['most_similar_feature'] else ""))
 
     # ── Step 7: Walk-forward validation ──────────────────────────────────────
-    ctx = context["data"]
+    import re
+    ctx = state.context["data"]
     freq_str = ctx["frequency"]
     horizon = ctx["horizon_seconds"]
-    import re
     m = re.match(r'(\d+)s', freq_str)
     freq_seconds = int(m.group(1)) if m else 10
     horizon_bars = horizon // freq_seconds
@@ -132,10 +125,39 @@ def run_cycle(
 
     # ── Step 8: Test ──────────────────────────────────────────────────────────
     print("Running feature tests...")
-    test_result = run_feature_test(feature, context, data, active_features=active_features)
-    if not test_result.ok:
-        raise RuntimeError(test_result.error)
-    test_results = test_result.value
+    if novelty["skip_test"]:
+        # near_duplicate with no meaningful parameter change — skip expensive evaluation
+        print(f"  Skipped: {novelty['novelty_explanation']}")
+        from src.agent.schemas import TestResults
+        test_results = TestResults(
+            per_pair={},
+            aggregate={
+                "skipped": True,
+                "skip_reason": "near_duplicate with no meaningful parameter change",
+            },
+        )
+    else:
+        test_result = run_feature_test(
+            feature, state.context, data, active_features=state.active_features
+        )
+        if not test_result.ok:
+            raise RuntimeError(test_result.error)
+        test_results = test_result.value
+
+    # Merge novelty signals into aggregate so reason.py and registry both see them
+    test_results.aggregate.update({
+        "novelty_score": novelty["novelty_score"],
+        "novelty_class": novelty["novelty_class"],
+        "most_similar_feature": novelty["most_similar_feature"],
+        "novelty_flags": novelty["novelty_flags"],
+        "novelty_explanation": novelty["novelty_explanation"],
+    })
+
+    # Compute and store composite feature score
+    feature_score = compute_feature_score(test_results.aggregate)
+    if feature_score is not None:
+        test_results.aggregate["feature_score"] = feature_score
+
     agg = test_results.aggregate
     lgbm_imp = agg.get("mean_improvement_vs_lgbm_pct")
     naive_imp = agg.get("mean_improvement_vs_naive_pct")
@@ -152,7 +174,10 @@ def run_cycle(
 
     # ── Step 9: Verdict ───────────────────────────────────────────────────────
     print("Reasoning and issuing verdict...")
-    reason_result = reason_and_verdict(feature, test_results, principles, context, active_features=active_features)
+    reason_result = reason_and_verdict(
+        feature, test_results, state.principles, state.context,
+        active_features=state.active_features
+    )
     if not reason_result.ok:
         raise RuntimeError(reason_result.error)
     reasoning = reason_result.value
@@ -167,10 +192,11 @@ def run_cycle(
 
     if verdict == "promoted":
         add_active_feature(feature)
+        from src.agent.active_features import load_active_features
         new_counts = get_level_counts(load_active_features())
         print(
-            f"  Feature added to {feature.get('level', 'primitive')} registry "
-            f"({new_counts['primitive']} primitive, {new_counts['transform']} transform, {new_counts['composite']} composite)"
+            f"  Feature promoted ({feature.level}): "
+            f"{new_counts['primitive']} primitive, {new_counts['transform']} transform, {new_counts['composite']} composite"
         )
     else:
         print(f"  Entry saved: {entry['id']}")
@@ -179,14 +205,17 @@ def run_cycle(
     print()
     print("Cycle summary")
     print("─" * 45)
+    print(f"  Action     : {feature.action}")
     print(f"  Stage      : {_STAGE_LABEL[stage]}")
     print(f"  Feature    : {feature.name} ({level_label})")
-    print(f"  Motivation : {feature.motivation, '—')}")
+    print(f"  Motivation : {feature.motivation}")
     print(
         f"  Validation : walk-forward CV, {n_folds} chronological folds, expanding window"
     )
     if lgbm_imp is not None:
         print(f"  RMSE change: {lgbm_imp:+.3f}% vs LightGBM | {naive_imp:+.3f}% vs naive")
+    if feature_score is not None:
+        print(f"  Score      : {feature_score:.4f}  (perf×0.5 + stability×0.3 + novelty×0.2)")
     print(f"  Verdict    : {verdict.upper()}")
     print()
 

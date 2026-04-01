@@ -31,14 +31,26 @@ def format_test_results_for_prompt(test_results) -> str:
         per_pair = test_results.get("per_pair", {})
 
     lines = ["AGGREGATE RESULTS:"]
-    lines.append(f"  Improvement vs LightGBM baseline: {agg.get('mean_improvement_vs_lgbm_pct')}%")
-    lines.append(f"  Improvement vs naive rolling vol baseline: {agg.get('mean_improvement_vs_naive_pct')}%")
-    lines.append(f"  Mean candidate importance: {agg.get('mean_candidate_importance_pct')}%")
-    lines.append(f"  Mean importance drift across folds: {agg.get('mean_importance_drift_pct')}%")
-    lines.append(f"  Any monotonic decay detected: {agg.get('any_monotonic_decay')}")
 
-    if agg.get("errors"):
-        lines.append(f"  Errors: {'; '.join(agg['errors'])}")
+    if agg.get("skipped"):
+        lines.append(f"  TEST SKIPPED: {agg.get('skip_reason', 'unknown reason')}")
+    else:
+        lines.append(f"  Improvement vs LightGBM baseline: {agg.get('mean_improvement_vs_lgbm_pct')}%")
+        lines.append(f"  Improvement vs naive rolling vol baseline: {agg.get('mean_improvement_vs_naive_pct')}%")
+        lines.append(f"  Mean candidate importance: {agg.get('mean_candidate_importance_pct')}%")
+        lines.append(f"  Mean importance drift across folds: {agg.get('mean_importance_drift_pct')}%")
+        lines.append(f"  Any monotonic decay detected: {agg.get('any_monotonic_decay')}")
+        if agg.get("errors"):
+            lines.append(f"  Errors: {'; '.join(agg['errors'])}")
+
+    # Novelty signals — always shown if present
+    novelty_class = agg.get("novelty_class")
+    if novelty_class:
+        lines.append(f"\nNOVELTY ASSESSMENT:")
+        lines.append(f"  Class: {novelty_class} (score {agg.get('novelty_score', 'n/a')})")
+        if agg.get("most_similar_feature"):
+            lines.append(f"  Most similar existing feature: {agg['most_similar_feature']}")
+        lines.append(f"  Detail: {agg.get('novelty_explanation', '')}")
 
     lines.append("\nPER-PAIR RESULTS:")
     for pair, results in per_pair.items():
@@ -87,7 +99,29 @@ def reason_and_verdict(
     results_str = format_test_results_for_prompt(test_results)
     counts = get_level_counts(active_features)
 
-    candidate_level = feature.get("level", "primitive")
+    if isinstance(test_results, TestResults):
+        agg = test_results.aggregate
+    else:
+        agg = test_results.get("aggregate", {}) if isinstance(test_results, dict) else {}
+
+    novelty_class = agg.get("novelty_class", "novel")
+    novelty_block = ""
+    if novelty_class == "near_duplicate":
+        novelty_block = (
+            f"\nNOVELTY GUARDRAIL: This feature is classified as near_duplicate "
+            f"(most similar: {agg.get('most_similar_feature', 'unknown')}). "
+            f"It should be rejected unless it demonstrates clearly superior performance "
+            f"AND a distinct mechanism not captured by the existing feature.\n"
+        )
+    elif novelty_class == "similar_family":
+        novelty_block = (
+            f"\nNOVELTY NOTE: This feature is from a similar family to "
+            f"'{agg.get('most_similar_feature', 'an existing feature')}'. "
+            f"Accept only if it shows material improvement. "
+            f"Reject if the improvement is marginal relative to the similarity.\n"
+        )
+
+    candidate_level = feature.get("level", "primitive") if isinstance(feature, dict) else getattr(feature, "level", "primitive")
 
     hierarchy_violation = None
     if candidate_level == "transform" and counts["primitive"] == 0:
@@ -105,15 +139,14 @@ You are a systematic quantitative research agent reviewing the test results for 
 
 Your role is to reason carefully against the research principles and issue a clear, defensible verdict.
 You must be sceptical. Marginal improvements do not justify promotion. Instability is grounds for rejection.
-{hierarchy_block}
-
+{hierarchy_block}{novelty_block}
 FEATURE PROPOSAL:
-Name: {feature.get('name')}
+Name: {feature.get('name') if isinstance(feature, dict) else feature.name}
 Level: {candidate_level}
-Motivation: {feature.get('motivation')}
-Hypothesis: {feature.get('hypothesis')}
-Construction: {feature.get('construction')}
-Pre-stated rejection criteria: {feature.get('rejection_criteria')}
+Motivation: {feature.get('motivation') if isinstance(feature, dict) else feature.motivation}
+Hypothesis: {feature.get('hypothesis') if isinstance(feature, dict) else feature.hypothesis}
+Construction: {feature.get('construction') if isinstance(feature, dict) else feature.construction}
+Pre-stated rejection criteria: {feature.get('rejection_criteria') if isinstance(feature, dict) else feature.rejection_criteria}
 
 TEST RESULTS:
 {results_str}

@@ -20,10 +20,71 @@ from src.agent.active_features import (
 )
 from src.agent.schemas import FeatureProposal
 from src.agent.tool import ToolResult, retry_api_call
+from src.agent.state import AgentState
 
 
 CLIENT = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 MODEL = "claude-sonnet-4-6"
+
+
+_ALL_ACTIONS = [
+    "explore_new_class",
+    "refine_existing",
+    "combine_features",
+    "increase_robustness",
+]
+
+
+def _format_action_stats(stats: dict, label: str) -> str:
+    """Render action stats as a compact, readable table for the prompt."""
+    if not stats:
+        return f"{label}: no data yet."
+
+    lines = [f"{label}:"]
+    seen = set()
+    for action in _ALL_ACTIONS:
+        if action not in stats:
+            continue
+        seen.add(action)
+        s = stats[action]
+        count = s["count"]
+        conf = " (LOW CONFIDENCE)" if s["low_confidence"] else ""
+        sr = f"{s['success_rate']:.0%}"
+        imp = f"{s['avg_improvement']:+.3f}%" if s["avg_improvement"] is not None else "n/a"
+        stab = f"{s['stability_score']:.2f}" if s["stability_score"] is not None else "n/a"
+        lines.append(
+            f"  {action:<24}: {count} cycles{conf} | success {sr} | avg improvement {imp} | stability {stab}"
+        )
+
+    missing = [a for a in _ALL_ACTIONS if a not in seen]
+    if missing:
+        lines.append(f"  [no data yet for: {', '.join(missing)}]")
+
+    return "\n".join(lines)
+
+
+def _format_top_features(top_features: list) -> str:
+    """Render top-K promoted features for the decision prompt."""
+    if not top_features:
+        return "No promoted features yet."
+    lines = []
+    for f in top_features:
+        score_str = f"{f['feature_score']:.4f}" if f.get("feature_score") is not None else "unscored"
+        lines.append(
+            f"  {f['name']:<30} level={f['level']:<12} score={score_str}"
+            + (f"  [{f['motivation'][:60]}]" if f.get("motivation") else "")
+        )
+    return "\n".join(lines)
+
+
+def _format_coverage(coverage: dict) -> str:
+    """Render feature space coverage as a compact table."""
+    if not coverage:
+        return "No coverage data yet (no features tested)."
+    lines = []
+    for key, info in coverage.items():
+        lines.append(f"  {key:<30}: {info['coverage']:<8} ({info['count']} tested)")
+    return "\n".join(lines)
 
 
 _STAGE_DESCRIPTION = {
@@ -66,46 +127,110 @@ _LEVEL_RULES = {
 
 
 def propose_feature(
-    context: dict,
-    principles: list,
-    registry: list,
+    state: AgentState,
     user_hint: str = None,
-    active_features: list = None
 ) -> ToolResult:
     """
-    Ask Claude to propose a candidate feature including a Python implementation.
+    Ask Claude to decide a research action and propose a candidate feature.
+
+    Claude first diagnoses the research state (recent verdicts, rejection patterns,
+    active feature coverage) and selects one of four actions before designing
+    the feature. The action and its rationale are returned alongside the feature.
+
     Returns a ToolResult containing a FeatureProposal on success.
     """
-
-    if active_features is None:
-        active_features = []
-
+    context = state.context
     context_str = format_context_for_prompt(context)
-    principles_str = format_principles_for_prompt(principles)
-    registry_str = format_registry_for_prompt(registry)
-    active_str = format_active_features_for_prompt(active_features)
+    principles_str = format_principles_for_prompt(state.principles)
+    registry_str = format_registry_for_prompt(state.registry)
+    active_str = format_active_features_for_prompt(state.active_features)
 
     freq_str = context["data"]["frequency"]
     m = re.match(r'(\d+)s', freq_str)
     freq_seconds = int(m.group(1)) if m else 10
     horizon_bars = context["data"]["horizon_seconds"] // freq_seconds
 
-    stage = get_research_stage(active_features)
-    counts = get_level_counts(active_features)
+    stage = state.research_stage
+    counts = state.level_counts
     stage_description = _STAGE_DESCRIPTION[stage]
     level_rules = _LEVEL_RULES[stage]
+
+    # Build a compact diagnostic block from structured state
+    recent_verdict_summary = (
+        ", ".join(state.recent_verdicts) if state.recent_verdicts else "none yet"
+    )
+    rejection_pattern = (
+        ", ".join(sorted(set(state.recent_rejection_reasons)))
+        if state.recent_rejection_reasons else "none"
+    )
 
     hint_block = (
         f"\nThe researcher has provided the following direction hint:\n{user_hint}\n"
         if user_hint else ""
     )
 
+    overall_stats_str = _format_action_stats(state.action_stats, "Overall (last 20 cycles)")
+    stage_stats_str = _format_action_stats(
+        state.action_stats_by_stage.get(stage, {}),
+        f"Current stage — {stage.upper()} features only"
+    )
+    top_features_str = _format_top_features(state.top_features)
+    coverage_str = _format_coverage(state.feature_space_coverage)
+
     prompt = f"""
 You are a systematic quantitative research agent specialising in FX volatility forecasting.
 
-Your task is to propose ONE candidate feature for testing, including a working Python implementation.
+Your task has TWO parts:
+  1. Decide which research action to take next, based on current state
+  2. Propose ONE candidate feature that executes that action
+
+---
+
+PART 1 — DECIDE YOUR ACTION
+
+Choose exactly one of the following actions. Base your choice on the research state below.
+
+Available actions:
+  - explore_new_class     → No features in this class yet, or repeated failures in same family → try something structurally different
+  - refine_existing       → A feature showed weak but consistent signal → tighten parameterisation or window choice
+  - combine_features      → Two complementary weak signals exist → build interaction or regime flag combining them
+  - increase_robustness   → A feature showed strong but unstable importance → add guards, wider windows, or clipped extremes
+
+Decision policy (apply in order):
+  1. If registry is empty or research stage is primitive with no active features → explore_new_class
+  2. If the same principle (e.g. P01, P03) appears repeatedly in recent rejections → increase_robustness or explore_new_class
+  3. If a "modified" verdict appeared recently → refine_existing
+  4. If two weak promoted features cover the same economic phenomenon → combine_features
+  5. Default → explore_new_class
+
+CURRENT RESEARCH STATE:
+  Stage              : {stage.upper()} (primitives: {counts['primitive']}, transforms: {counts['transform']}, composites: {counts['composite']})
+  Total cycles run   : {state.cycle_count}
+  Features promoted  : {state.promoted_count}
+  Recent verdicts    : {recent_verdict_summary}
+  Rejection triggers : {rejection_pattern}
+
+ACTION PERFORMANCE HISTORY:
+{overall_stats_str}
+
+{stage_stats_str}
+
+How to use these stats (soft guidance only):
+- Prioritise the current-stage stats when count ≥ 3; fall back to overall if stage data is sparse
+- Favour actions with high success_rate AND positive avg_improvement
+- Avoid actions with consistently negative avg_improvement across ≥ 3 cycles
+- LOW CONFIDENCE (< 3 cycles): treat as a weak signal — do not over-index on it
+- Do NOT mechanically follow the stats; context, stage, and recent rejections matter more
+- If all stats are empty (early cycles), rely on the decision policy above
+
+{hint_block}
+
+---
+
+PART 2 — PROPOSE THE FEATURE
 
 The feature must be:
+- Consistent with your chosen action
 - Economically motivated with a clear and testable signal hypothesis
 - Constructable from the available data described below
 - Not already tested (check the registry history)
@@ -114,23 +239,33 @@ The feature must be:
 - Focused on a single hypothesis (avoid multi-component designs unless justified)
 
 Research philosophy:
-- Before proposing, consider what has already been established and what the simplest meaningful next step would be
-- Prefer foundational signals early in the research process — simple, interpretable constructions that test one hypothesis at a time
-- Complexity must be justified by what simpler features cannot explain; do not propose multi-component features when a single-component version is untested
-
-{hint_block}
+- Prefer foundational signals early — simple, interpretable constructions that test one hypothesis at a time
+- Complexity must be justified by what simpler features cannot explain
 
 CURRENT RESEARCH STAGE: {stage.upper()} EXPLORATION
 {stage_description}
+
+TOP-RANKED PROMOTED FEATURES (composite score: perf×0.5 + stability×0.3 + novelty×0.2, then penalised for duplicates/instability):
+{top_features_str}
+
+Guidance (soft):
+- If any feature has score > 0.6: strongly consider refine_existing or combine_features targeting it
+- If no feature exceeds 0.5: the active set is weak — prefer explore_new_class in a low-coverage region
+- Do NOT refine a feature purely because it is top-ranked; require a clear hypothesis for improvement
+
+FEATURE SPACE COVERAGE (base_type + transform_type across all tested features — HIGH means overrepresented):
+{coverage_str}
+
+Guidance (soft):
+- Strongly prefer LOW coverage regions when no strong candidates exist (score < 0.5)
+- Avoid HIGH coverage regions unless the proposed construction is clearly distinct from existing ones
+- MEDIUM coverage regions are fair game if the hypothesis is novel within that family
 
 ACTIVE FEATURE SET:
 {active_str}
 
 HIERARCHY RULES FOR THIS CYCLE:
 {level_rules}
-- Primitives promoted: {counts['primitive']}
-- Transforms promoted: {counts['transform']}
-- Composites promoted: {counts['composite']}
 
 DATA CONTEXT:
 {context_str}
@@ -162,6 +297,8 @@ Requirements for the code:
 
 Respond ONLY with a valid JSON object in exactly this structure, no preamble, no markdown:
 {{
+  "action": "explore_new_class",
+  "action_rationale": "why you chose this action given the current research state",
   "name": "short_descriptive_feature_name",
   "level": "primitive",
   "motivation": "one-line research motivation",

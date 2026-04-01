@@ -1,0 +1,30 @@
+data:
+  pairs:
+    - GBPUSD
+  frequency: "10s"
+  time_range:
+    start: "2024-02-18 22:00"
+    end: "2025-11-14 22:00"
+  horizon_seconds: 3600
+
+known_regimes:
+  - name: "Low volatility"
+    description: "Stable macro backdrop, tight ranges, mean-reverting intraday moves"
+  - name: "Risk-off / high volatility"
+    description: "Elevated uncertainty, wider spreads, directional momentum dominates"
+  - name: "Central bank divergence"
+    description: "BoE/Fed policy paths diverging; GBP/USD driven by rate differentials"
+
+structural_breaks:
+  - date: "2024-08-07"
+    description: "BoE hawkish cut (5-4 vote); GBP/USD spiked, short-lived vol spike"
+  - date: "2025-04-02"
+    description: "US Liberation Day tariffs; USD weakness despite tariff announcement"
+  - date: "2025-08-01"
+    description: "Escalating US-UK trade negotiations; elevated GBP vol"
+
+quality_flags:
+  - "No volume column — OHLC only"
+  - "10-second candle resolution (mid prices)"
+  - "Gaps possible during weekends and low-liquidity windows"
+  - "Timestamps are UTC"

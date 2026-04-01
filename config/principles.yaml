@@ -1,0 +1,63 @@
+principles:
+  - id: "P01"
+    name: "Regime Robustness"
+    description: >
+      Features must demonstrate predictive value across different market regimes,
+      not just in calm or trending conditions. A feature that only works in one
+      regime is not useful for a general-purpose volatility forecasting system.
+    rejection_trigger: >
+      Feature importance or improvement is concentrated in a single regime or
+      time period. Strong performance in early folds collapses in later folds
+      that cover different market conditions.
+
+  - id: "P02"
+    name: "No Look-Ahead"
+    description: >
+      All feature computations must be strictly backward-looking. At prediction
+      time t, only information available at or before t may be used. Rolling
+      windows, lags, and any statistical estimations must use only past data.
+    rejection_trigger: >
+      Feature code references future bar data, uses shift(-n) for positive n,
+      or any construction that could introduce forward-looking bias.
+
+  - id: "P03"
+    name: "Importance Stability"
+    description: >
+      Feature importance should be consistent across walk-forward folds. High
+      variance in importance suggests the feature is capturing noise or
+      regime-specific patterns rather than a persistent signal.
+    rejection_trigger: >
+      Importance drift across folds exceeds 50%. Feature is highly important
+      in some folds and near-zero in others, indicating unstable signal.
+
+  - id: "P04"
+    name: "OOS Improvement"
+    description: >
+      A feature must demonstrate measurable improvement over the LightGBM
+      baseline (rolling vol features only) on held-out out-of-sample folds.
+      Marginal or negative improvement does not justify adding complexity.
+    rejection_trigger: >
+      Mean OOS RMSE improvement vs LightGBM baseline is negative or less than
+      0.1%. The feature adds no predictive power beyond existing signals.
+
+  - id: "P05"
+    name: "Economic Motivation"
+    description: >
+      Every feature must have a clear, plausible economic or microstructural
+      rationale. Features without an interpretable mechanism are difficult to
+      trust in live trading and may be data artefacts.
+    rejection_trigger: >
+      The feature lacks a coherent economic story, or its observed behaviour
+      contradicts its stated hypothesis (e.g., claimed vol predictor but
+      negatively correlated with future vol).
+
+  - id: "P06"
+    name: "Signal Persistence"
+    description: >
+      Feature importance should not decay monotonically across chronological
+      folds. Monotonic decay suggests the feature captured historical patterns
+      that have since dissipated — a classic out-of-sample deterioration pattern.
+    rejection_trigger: >
+      Feature importance decreases in every successive fold, forming a
+      monotonically declining sequence. This is a strong signal of overfitting
+      to earlier data.
