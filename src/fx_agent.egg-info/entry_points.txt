@@ -1,0 +1,2 @@
+[console_scripts]
+frontier = agent.cli:main

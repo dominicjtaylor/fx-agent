@@ -1,0 +1,9 @@
+[project]
+name = "fx-agent"
+version = "0.1.0"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+frontier = "agent.cli:main"
